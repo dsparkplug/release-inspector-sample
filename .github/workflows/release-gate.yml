@@ -76,4 +76,10 @@ jobs:
           RI_SUBSCRIPTION_KEY: ${{ secrets.RI_SUBSCRIPTION_KEY }}
           RI_API_URL: ${{ vars.RI_API_URL }}
           RI_WEB_URL: ${{ vars.RI_WEB_URL }}
-        run: tools\ri.exe submit out\HelloRelease.exe --product HelloRelease --version $env:VERSION --fail-on High
+        # GitHub's PowerShell steps turn any failing command into exit code 1, so ri's own code is passed on instead:
+        # 1 for a finding at or above the threshold, 3 for a release that could not be inspected, 4 for a timeout and 5
+        # when the service refused or could not be reached.
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          tools\ri.exe submit out\HelloRelease.exe --product HelloRelease --version $env:VERSION --fail-on High
+          exit $LASTEXITCODE
