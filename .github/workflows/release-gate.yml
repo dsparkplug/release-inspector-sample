@@ -1,0 +1,79 @@
+name: Release gate
+
+# Builds a tiny program, signs it with the test certificate held in Release Inspector's Key Vault, and submits it to
+# Release Inspector with ri. The run fails when the report has anything High. The variant input shows the gate both
+# ways: a signed build passes, and an unsigned build, or one changed after signing, fails.
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "signed should pass; unsigned and altered (changed after signing) should fail"
+        type: choice
+        options:
+          - signed
+          - unsigned
+          - altered
+        default: signed
+
+permissions:
+  contents: read
+  # Lets the job request the OpenID Connect token that signs in to Azure as the signing identity, with no secret.
+  id-token: write
+
+jobs:
+  gate:
+    # AzureSignTool uses Windows' own signing APIs.
+    runs-on: windows-latest
+    env:
+      VERSION: 1.0.${{ github.run_number }}
+      KEY_VAULT_URL: ${{ vars.KEY_VAULT_URL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build
+        run: dotnet publish src/HelloRelease --configuration Release --runtime win-x64 --no-self-contained -p:PublishSingleFile=true -p:Version=$env:VERSION --output out
+
+      # The signing identity can sign with the test certificate's key and read the certificate, and nothing else.
+      - name: Sign in to Azure as the signing identity
+        if: inputs.variant != 'unsigned'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      # The private key never leaves Key Vault: AzureSignTool sends Key Vault the file's digest to sign, using the
+      # Azure CLI's sign-in from the previous step.
+      - name: Sign with the Key Vault certificate
+        if: inputs.variant != 'unsigned'
+        run: |
+          dotnet tool install AzureSignTool --version 7.0.1 --tool-path tools
+          tools\azuresigntool.exe sign --azure-key-vault-url $env:KEY_VAULT_URL --azure-key-vault-certificate test-signing --azure-key-vault-managed-identity --timestamp-rfc3161 http://timestamp.digicert.com --timestamp-digest sha256 --file-digest sha256 out\HelloRelease.exe
+
+      # Flips one byte of the program's code, so its contents no longer match its signature.
+      - name: Change the file after signing
+        if: inputs.variant == 'altered'
+        run: |
+          $path = 'out\HelloRelease.exe'
+          $bytes = [IO.File]::ReadAllBytes($path)
+          $bytes[0x400] = $bytes[0x400] -bxor 0xFF
+          [IO.File]::WriteAllBytes($path, $bytes)
+
+      # ri.exe is published to this repository's releases from Release Inspector's own repository, which is private.
+      - name: Download ri
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download --repo $env:GITHUB_REPOSITORY --pattern ri.exe --dir tools --clobber
+
+      - name: Submit to Release Inspector
+        env:
+          RI_SUBSCRIPTION_KEY: ${{ secrets.RI_SUBSCRIPTION_KEY }}
+          RI_API_URL: ${{ vars.RI_API_URL }}
+          RI_WEB_URL: ${{ vars.RI_WEB_URL }}
+        run: tools\ri.exe submit out\HelloRelease.exe --product HelloRelease --version $env:VERSION --fail-on High
